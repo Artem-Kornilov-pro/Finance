@@ -2,8 +2,8 @@ import os
 import psycopg2
 from psycopg2 import pool, extras
 from fastapi import FastAPI, HTTPException, Depends, Header
-from pydantic import BaseModel, EmailStr
-from pydantic.types import condecimal
+from pydantic import BaseModel, EmailStr, condecimal
+#from pydantic.types import condecimal
 from typing import List
 import redis
 import jwt
@@ -28,6 +28,20 @@ DATABASE_URL = f"postgresql://{POSTGRES_USERNAME}:{POSTGRES_PASSWORD}@{POSTGRES_
 # Настройка БД
 redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 db_pool = pool.SimpleConnectionPool(1, 10, DATABASE_URL)
+
+
+
+def get_current_user_id(authorization: str = Header(...)) -> int:
+    token = authorization.replace("Bearer ", "")
+    
+    user_id = redis_client.get(f"token:{token}")
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    
+    return int(user_id)
+
+
+
 
 def get_connection():
     return db_pool.getconn()
@@ -88,13 +102,12 @@ class UserUpdate(BaseModel):
     password: str
 
 class TransactionCreate(BaseModel):
-    user_id: int
-    amount: condecimal(max_digits=10, decimal_places=2)
+    amount: condecimal(max_digits=10, decimal_places=2) # type: ignore
     category_id: int
     type: str
 
 class TransactionUpdate(BaseModel):
-    amount: condecimal(max_digits=10, decimal_places=2)
+    amount: condecimal(max_digits=10, decimal_places=2) # type: ignore
     category_id: int
     type: str
 
@@ -108,8 +121,12 @@ class CategoryCreate(BaseModel):
 def create_token(user_id: int):
     payload = {"user_id": user_id, "exp": datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRE_MINUTES)}
     token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
-    redis_client.setex(f"token:{user_id}", TOKEN_EXPIRE_MINUTES * 60, token)
+    
+    # Теперь ключ — это сам токен, а значение — user_id
+    redis_client.setex(f"token:{token}", TOKEN_EXPIRE_MINUTES * 60, user_id)
+    
     return token
+
 
 def verify_token(token: str):
     try:
@@ -199,13 +216,13 @@ def update_profile(user_data: UserUpdate, authorization: str = Header(None)):
 
 # Эндпойнты для транзакций
 @app.post("/transactions")
-def create_transaction(transaction: TransactionCreate):
+def create_transaction(transaction: TransactionCreate, user_id: int = Depends(get_current_user_id)):
     conn = get_connection()
     try:
         with conn.cursor() as cursor:
             cursor.execute(
                 "INSERT INTO transactions (user_id, amount, category_id, type) VALUES (%s, %s, %s, %s) RETURNING id",
-                (transaction.user_id, transaction.amount, transaction.category_id, transaction.type)
+                (user_id, transaction.amount, transaction.category_id, transaction.type)
             )
             transaction_id = cursor.fetchone()[0]
         conn.commit()
@@ -214,53 +231,52 @@ def create_transaction(transaction: TransactionCreate):
         release_connection(conn)
 
 @app.get("/transactions")
-def get_transactions():
+def get_transactions(user_id: int = Depends(get_current_user_id)):
     conn = get_connection()
     try:
         with conn.cursor(cursor_factory=extras.RealDictCursor) as cursor:
-            cursor.execute("SELECT * FROM transactions")
-            transactions = cursor.fetchall()
-        return transactions
+            cursor.execute("SELECT * FROM transactions WHERE user_id = %s", (user_id,))
+            return cursor.fetchall()
     finally:
         release_connection(conn)
 
 @app.get("/transactions/{id}")
-def get_transaction(id: int):
+def get_transaction(id: int, user_id: int = Depends(get_current_user_id)):
     conn = get_connection()
     try:
         with conn.cursor(cursor_factory=extras.RealDictCursor) as cursor:
-            cursor.execute("SELECT * FROM transactions WHERE id = %s", (id,))
+            cursor.execute("SELECT * FROM transactions WHERE id = %s AND user_id = %s", (id, user_id))
             transaction = cursor.fetchone()
             if not transaction:
                 raise HTTPException(status_code=404, detail="Transaction not found")
-        return transaction
+            return transaction
     finally:
         release_connection(conn)
 
 @app.patch("/transactions/{id}")
-def update_transaction(id: int, transaction: TransactionUpdate):
+def update_transaction(id: int, transaction: TransactionUpdate, user_id: int = Depends(get_current_user_id)):
     conn = get_connection()
     try:
         with conn.cursor() as cursor:
             cursor.execute(
-                "UPDATE transactions SET amount = %s, category_id = %s, type = %s WHERE id = %s RETURNING id",
-                (transaction.amount, transaction.category_id, transaction.type, id)
+                "UPDATE transactions SET amount = %s, category_id = %s, type = %s WHERE id = %s AND user_id = %s",
+                (transaction.amount, transaction.category_id, transaction.type, id, user_id)
             )
             if cursor.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Transaction not found")
+                raise HTTPException(status_code=404, detail="Transaction not found or access denied")
         conn.commit()
         return {"message": "Transaction updated successfully"}
     finally:
         release_connection(conn)
 
 @app.delete("/transactions/{id}")
-def delete_transaction(id: int):
+def delete_transaction(id: int, user_id: int = Depends(get_current_user_id)):
     conn = get_connection()
     try:
         with conn.cursor() as cursor:
-            cursor.execute("DELETE FROM transactions WHERE id = %s", (id,))
+            cursor.execute("DELETE FROM transactions WHERE id = %s AND user_id = %s", (id, user_id))
             if cursor.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Transaction not found")
+                raise HTTPException(status_code=404, detail="Transaction not found or access denied")
         conn.commit()
         return {"message": "Transaction deleted successfully"}
     finally:
